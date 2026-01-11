@@ -54,6 +54,10 @@ private:
     std::map<std::pair<uint8_t, uint64_t>, uint64_t> virt_to_phys_map; // <host_id, virt_addr> -> phys_addr
     std::mutex mapping_mutex;
     
+    // Track connected clients by host ID for broadcasting invalidations
+    std::map<uint8_t, int> host_to_client_fd;
+    std::mutex clients_mutex;
+    
     // Configurable latency parameters
     double base_read_latency_ns;
     double base_write_latency_ns;
@@ -116,6 +120,12 @@ public:
         // Get host ID from client (simplified - in real implementation, this would be part of handshake)
         static std::atomic<uint8_t> next_host_id{1};
         uint8_t host_id = next_host_id.fetch_add(1);
+        
+        // Register this client for broadcasting
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            host_to_client_fd[host_id] = client_fd;
+        }
         
         while (running) {
             // First try to receive enhanced request
@@ -180,6 +190,12 @@ public:
         }
         mapping_mutex.unlock();
         
+        // Unregister this client
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            host_to_client_fd.erase(host_id);
+        }
+        
         close(client_fd);
     }
     
@@ -205,23 +221,68 @@ public:
         uint64_t virtual_addr;
     };
     
+    // Broadcast back-invalidation to all sharers except the requester
+    void broadcast_back_invalidation(CXLMemoryEntry& entry, uint8_t requester_id, BISnpReqType bisnp_req_opcode) {
+        CXLMemSimResponse resp = {0};
+        resp.status = 0;
+        resp.bisnp_req = bisnp_req_opcode;
+        resp.addr = entry.metadata.physical_addr;
+        
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        
+        // Iterate through all potential sharers (up to 16 hosts in bitmap)
+        uint16_t sharers = entry.metadata.sharers_bitmap;
+        for (uint8_t host_id = 0; host_id < 16 && sharers != 0; host_id++) {
+            if ((sharers & (1 << host_id)) && host_id != requester_id) {
+                // Find the client socket for this host
+                auto it = host_to_client_fd.find(host_id);
+                if (it != host_to_client_fd.end()) {
+                    int target_fd = it->second;
+                    ssize_t sent = send(target_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+                    if (sent != sizeof(resp)) {
+                        std::cerr << "Failed to send invalidation to host " << (int)host_id << std::endl;
+                    } else {
+                        std::cout << "Sent back-invalidation to host " << (int)host_id 
+                                  << " for addr 0x" << std::hex << entry.metadata.physical_addr 
+                                  << std::dec << std::endl;
+                    }
+                }
+            }
+        }
+    }
+
     CacheState handle_coherency_transition(CXLMemoryEntry& entry, uint8_t requester_id, bool is_write) {
         CacheState old_state = static_cast<CacheState>(entry.metadata.cache_state);
         CacheState new_state = old_state;
         
         if (is_write) {
-            // Write request handling
+            // Write request handling - need to invalidate all other sharers
             switch (old_state) {
                 case MESI_INVALID:
+                    new_state = MESI_MODIFIED;
+                    entry.metadata.owner_id = requester_id;
+                    entry.metadata.sharers_bitmap = (1 << requester_id);
+                    break;
                 case MESI_SHARED:
+                    // Broadcast invalidation to all sharers before taking ownership
+                    broadcast_back_invalidation(entry, requester_id, BISnpInv);
+                    new_state = MESI_MODIFIED;
+                    entry.metadata.owner_id = requester_id;
+                    entry.metadata.sharers_bitmap = (1 << requester_id);
+                    break;
                 case MESI_EXCLUSIVE:
+                    if (entry.metadata.owner_id != requester_id) {
+                        // Invalidate current exclusive owner
+                        broadcast_back_invalidation(entry, requester_id, BISnpInv);
+                    }
                     new_state = MESI_MODIFIED;
                     entry.metadata.owner_id = requester_id;
                     entry.metadata.sharers_bitmap = (1 << requester_id);
                     break;
                 case MESI_MODIFIED:
                     if (entry.metadata.owner_id != requester_id) {
-                        // Need to invalidate current owner
+                        // Need to invalidate current owner and get data
+                        broadcast_back_invalidation(entry, requester_id, BISnpInv);
                         new_state = MESI_MODIFIED;
                         entry.metadata.owner_id = requester_id;
                         entry.metadata.sharers_bitmap = (1 << requester_id);
@@ -238,6 +299,8 @@ public:
                     break;
                 case MESI_EXCLUSIVE:
                     if (entry.metadata.owner_id != requester_id) {
+                        // Downgrade exclusive owner to shared
+                        broadcast_back_invalidation(entry, requester_id, BISnpData);
                         new_state = MESI_SHARED;
                         entry.metadata.sharers_bitmap |= (1 << requester_id);
                     }
@@ -247,6 +310,8 @@ public:
                     break;
                 case MESI_MODIFIED:
                     if (entry.metadata.owner_id != requester_id) {
+                        // Get data from modified owner and transition to shared
+                        broadcast_back_invalidation(entry, requester_id, BISnpData);
                         new_state = MESI_SHARED;
                         entry.metadata.sharers_bitmap |= (1 << requester_id);
                     }
@@ -294,7 +359,7 @@ public:
         
         // Add latency based on state transition
         uint64_t base_latency = calculate_latency(size, true);
-        if (new_state == MESI_SHARED && entry.metadata.cache_state == MESI_MODIFIED) {
+        if (new_state == MESI_SHARED && (entry.metadata.cache_state == MESI_MODIFIED || entry.metadata.cache_state == MESI_EXCLUSIVE)) {
             base_latency += 50; // Additional latency for writeback
         }
         
