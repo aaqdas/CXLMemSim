@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -386,6 +387,7 @@ int cxlmemsim_check_invalidation(uint64_t phys_addr, size_t size, void *data) {
 
 // Register invalidation for an address
 void cxlmemsim_register_invalidation(uint64_t phys_addr, void *data, size_t size) {
+    printf("Registering invalidation for PA 0x%lx\n", phys_addr);
     if (!inv_queue) return;
     
     pthread_mutex_lock(&inv_queue->mutex);

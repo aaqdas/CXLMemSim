@@ -7,6 +7,9 @@ VM_MEMORY=${VM_MEMORY:-2G}
 CXL_MEMORY=${CXL_MEMORY:-4G}
 DISK_IMAGE=${DISK_IMAGE:-plucky-server-cloudimg-amd64.img}
 
+DRIVE_IMAGE=/home/ali/OCEAN-V2/OCEAN/qemu_integration/build/qemu1.img
+KERNEL_IMAGE=/home/ali/OCEAN-V2/OCEAN/qemu_integration/build/bzImage
+
 # Enable SHM mode with lock-free coherency
 export CXL_TRANSPORT_MODE=shm
 export CXL_HOST_ID=1
@@ -15,9 +18,9 @@ $QEMU_BINARY \
     -m 16G,maxmem=32G,slots=8 \
     -smp 4 \
     -M q35,cxl=on \
-    -kernel ./bzImage \
+    -kernel $KERNEL_IMAGE \
     -append "root=/dev/sda rw console=ttyS0,115200 nokaslr" \
-    -drive file=./qemu1.img,index=0,media=disk,format=raw \
+    -drive file=$DRIVE_IMAGE,index=0,media=disk,format=raw \
     -netdev tap,id=net0,ifname=tap1,script=no,downscript=no \
     -device virtio-net-pci,netdev=net0,mac=52:54:00:00:00:02 \
     -fsdev local,security_model=none,id=fsdev0,path=/dev/shm \
