@@ -27,14 +27,6 @@
 #include <stdbool.h>
 
 #define CACHELINE_SIZE 64
-#define BISnpOpCode 0x80
-
-/* MESI states */
-#define MESI_INVALID   0
-#define MESI_SHARED    1
-#define MESI_EXCLUSIVE 2
-#define MESI_MODIFIED  3
-
 
 /* Protocol structures (matching server) */
 enum BISnpReqType {
@@ -132,28 +124,8 @@ static int connect_to_server(const char *host, int port) {
     return sock;
 }
 
-// Simple cacheline MESI state and data map for guest (simulate 64K cachelines)
-#define MAX_CACHELINES 65536
-static int guest_cache_mesi_state[MAX_CACHELINES] = {[0 ... MAX_CACHELINES-1] = MESI_INVALID};
-static uint8_t guest_cache_data[MAX_CACHELINES][CACHELINE_SIZE] = {{0}};
-
-static const char* mesi_state_str(int state) {
-    switch (state) {
-        case MESI_INVALID: return "INVALID";
-        case MESI_SHARED: return "SHARED";
-        case MESI_EXCLUSIVE: return "EXCLUSIVE";
-        case MESI_MODIFIED: return "MODIFIED";
-        default: return "?";
-    }
-}
-
 /* Handle incoming back-invalidation request */
 static void handle_invalidation(CXLMemSimResponse *resp) {
-    uint64_t idx = (resp->addr / CACHELINE_SIZE) % MAX_CACHELINES;
-    int *state = &guest_cache_mesi_state[idx];
-    uint8_t *cacheline = guest_cache_data[idx];
-    printf("[MESI] Guest cacheline idx %lu current state: %s\n", idx, mesi_state_str(*state));
-
     printf("\n╔══════════════════════════════════════════════════════════════╗\n");
     printf("║ 🔔 BACK-INVALIDATION RECEIVED                                 ║\n");
     printf("╠══════════════════════════════════════════════════════════════╣\n");
@@ -176,130 +148,56 @@ static void handle_invalidation(CXLMemSimResponse *resp) {
         case BISnpInv:  g_stats.bisnp_inv++; break;
     }
     atomic_fetch_add(&g_invalidations_received, 1);
-    
-    CXLMemSimRequest BIRsp = {0};
 
-    // Simulate updating the local MESI state
-    printf("[MESI] Updating local MESI state for address 0x%016lx\n", resp->addr);
-    // State transition logic for BISnpData
-    if (resp->bisnp_req == BISnpData) {
-        BIRsp.op_type = BISnpOpCode; // Custom op for BISnpData response (not standard)
-        BIRsp.addr = resp->addr;
-        BIRsp.size = CACHELINE_SIZE;
-        BIRsp.timestamp = get_timestamp_ns();
-        if (*state == MESI_MODIFIED || *state == MESI_EXCLUSIVE || *state == MESI_SHARED) {
-            BIRsp.bisnp_resp = BISnpS;
-            memcpy(BIRsp.data, cacheline, CACHELINE_SIZE);
-            printf("[MESI] State Transitioned from (MES -> S)\n");
-            *state = MESI_SHARED;
-        } else {
-            BIRsp.bisnp_resp = BISnpI;
-            printf("[MESI] State Invalid Maintained (I -> I)\n");
-            *state = MESI_INVALID;
-        }
-        pthread_mutex_lock(&g_socket_lock);
-        send(g_socket_fd, &BIRsp, sizeof(BIRsp), 0);
-        pthread_mutex_unlock(&g_socket_lock);
-        printf("[MESI] Sent back BIRsp with state %s for address 0x%016lx\n", mesi_state_str(*state), resp->addr);
-    }
-
-    if (resp->bisnp_req == BISnpInv){
-        printf("[MESI] Received invalidation request. Transitioning to INVALID\n");
-        BIRsp.op_type = BISnpOpCode; // Custom op for BISnpInv BIRsp (not standard)
-        BIRsp.addr = resp->addr;
-        BIRsp.size = CACHELINE_SIZE;
-        BIRsp.timestamp = get_timestamp_ns();
-        BIRsp.bisnp_resp = BISnpI;
-        memcpy(BIRsp.data, cacheline, CACHELINE_SIZE);
-        pthread_mutex_lock(&g_socket_lock);
-        send(g_socket_fd, &BIRsp, sizeof(BIRsp), 0);
-        pthread_mutex_unlock(&g_socket_lock);
-        printf("[MESI] Sent back BIRsp with state INVALID for address 0x%016lx\n", resp->addr);
-        *state = MESI_INVALID;
-    }
-
-    if (resp->bisnp_req == BISnpCurr){
-        BIRsp.op_type = BISnpOpCode; // Custom op for BISnpData response (not standard)
-        BIRsp.addr = resp->addr;
-        BIRsp.size = CACHELINE_SIZE;
-        BIRsp.timestamp = get_timestamp_ns();
-        if (*state == MESI_MODIFIED || *state == MESI_EXCLUSIVE) {
-            BIRsp.bisnp_resp = BISnpE;
-            memcpy(BIRsp.data, cacheline, CACHELINE_SIZE);
-            printf("[MESI] State Maintained\n");
-        } else if (*state == MESI_SHARED) {
-            BIRsp.bisnp_resp = BISnpS;
-            memcpy(BIRsp.data, cacheline, CACHELINE_SIZE);
-            printf("[MESI] State Maintained\n");
-        } else {
-            BIRsp.bisnp_resp = BISnpI;
-            memcpy(BIRsp.data, cacheline, CACHELINE_SIZE);
-            printf("[MESI] State Invalid Maintained (I -> I)\n");
-        }
-        pthread_mutex_lock(&g_socket_lock);
-        send(g_socket_fd, &BIRsp, sizeof(BIRsp), 0);
-        pthread_mutex_unlock(&g_socket_lock);
-        printf("[MESI] Sent back BIRsp with state %s for address 0x%016lx\n", mesi_state_str(*state), resp->addr);
-    }
-    // Print new state after handling
-    printf("[MESI] Guest cacheline idx %lu new state: %s\n", idx, mesi_state_str(*state));
+    /* In a real implementation, we would:
+     * 1. Invalidate local cache for this address
+     * 2. Send back response with data if BISnpData
+     * 3. Update local MESI state
+     */
 }
 
 /* Send a read request and wait for response */
 static int cxl_read(uint64_t addr, uint8_t *data, size_t size) {
-    uint64_t idx = (addr / CACHELINE_SIZE) % MAX_CACHELINES;
-    if (guest_cache_mesi_state[idx] != MESI_INVALID) {
-        // Service from local cache
-        memcpy(data, guest_cache_data[idx], CACHELINE_SIZE);
-        printf("[MESI] Read serviced from guest cache idx %lu, state: %s\n", idx, mesi_state_str(guest_cache_mesi_state[idx]));
-        return 0;
-    }
-    // Otherwise, fetch from CXL device
     CXLMemSimRequest req = {0};
     CXLMemSimResponse resp = {0};
+
     req.op_type = CXL_READ_OP;
     req.addr = addr;
     req.size = size;
     req.timestamp = get_timestamp_ns();
+
     pthread_mutex_lock(&g_socket_lock);
+
     if (send(g_socket_fd, &req, sizeof(req), 0) != sizeof(req)) {
         perror("send read request");
         pthread_mutex_unlock(&g_socket_lock);
         return -1;
     }
+
     if (recv(g_socket_fd, &resp, sizeof(resp), MSG_WAITALL) != sizeof(resp)) {
         perror("recv read response");
         pthread_mutex_unlock(&g_socket_lock);
         return -1;
     }
+
     pthread_mutex_unlock(&g_socket_lock);
+
+    /* Check if this response contains a back-invalidation */
     if (resp.bisnp_req != 0) {
         handle_invalidation(&resp);
     }
+
     if (resp.status == 0) {
         memcpy(data, resp.data, size < CACHELINE_SIZE ? size : CACHELINE_SIZE);
-        // Update local cache and state
-        memcpy(guest_cache_data[idx], data, CACHELINE_SIZE);
-        guest_cache_mesi_state[idx] = MESI_EXCLUSIVE; // Assume exclusive on read for this test
         g_stats.reads++;
-        printf("[MESI] Read fetched from CXL device and cached at idx %lu\n", idx);
         return 0;
     }
+
     return -1;
 }
 
 /* Send a write request and wait for response */
 static int cxl_write(uint64_t addr, const uint8_t *data, size_t size) {
-    uint64_t idx = (addr / CACHELINE_SIZE) % MAX_CACHELINES;
-    if (guest_cache_mesi_state[idx] == MESI_MODIFIED || guest_cache_mesi_state[idx] == MESI_EXCLUSIVE) {
-        // Service from local cache
-        memcpy(data, guest_cache_data[idx], CACHELINE_SIZE);
-        guest_cache_mesi_state[idx] = MESI_MODIFIED;
-        printf("[MESI] Write serviced to guest cache idx %lu, state: %s\n", idx, mesi_state_str(guest_cache_mesi_state[idx]));
-        return 0;
-    }
-    
-    
     CXLMemSimRequest req = {0};
     CXLMemSimResponse resp = {0};
 
@@ -331,10 +229,6 @@ static int cxl_write(uint64_t addr, const uint8_t *data, size_t size) {
     }
 
     if (resp.status == 0) {
-        // Update local cache and state
-        uint64_t idx = (addr / CACHELINE_SIZE) % MAX_CACHELINES;
-        memcpy(guest_cache_data[idx], data, CACHELINE_SIZE);
-        guest_cache_mesi_state[idx] = MESI_MODIFIED;
         g_stats.writes++;
         return 0;
     }

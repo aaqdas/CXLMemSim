@@ -13,7 +13,7 @@
 #include <random>
 #include <csignal>
 #include "../include/qemu_cxl_memsim.h"
-
+#define DETAIL_STATS
 // Cache coherency states (MESI protocol)
 enum CacheState {
     MESI_INVALID = 0,
@@ -61,6 +61,7 @@ private:
     // Configurable latency parameters
     double base_read_latency_ns;
     double base_write_latency_ns;
+    double base_bisnp_latency_ns; // based on performance recommendations of cxl 3.2 spec (table 13.2)
     double bandwidth_gbps;
     
     struct AccessStats {
@@ -75,6 +76,7 @@ public:
         : port(port), running(true),
           base_read_latency_ns(200.0),  // CXL typical read latency
           base_write_latency_ns(100.0),  // CXL typical write latency
+          base_bisnp_latency_ns(90.0),  // worst case cxl 3.2 bisnp latency (table 13.2)
           bandwidth_gbps(64.0) {         // CXL 2.0 x8 bandwidth
     }
     
@@ -110,6 +112,7 @@ public:
         std::cout << "Configuration:" << std::endl;
         std::cout << "  Read Latency: " << base_read_latency_ns << " ns" << std::endl;
         std::cout << "  Write Latency: " << base_write_latency_ns << " ns" << std::endl;
+        std::cout << "  BISnp Latency: " << base_bisnp_latency_ns << " ns" << std::endl;
         std::cout << "  Bandwidth: " << bandwidth_gbps << " GB/s" << std::endl;
         return true;
     }
@@ -117,14 +120,24 @@ public:
     void handle_client(int client_fd) {
         std::cout << "Client connected" << std::endl;
         
-        // Get host ID from client (simplified - in real implementation, this would be part of handshake)
+        // Assign or retrieve host ID for this client_fd
         static std::atomic<uint8_t> next_host_id{1};
-        uint8_t host_id = next_host_id.fetch_add(1);
-        
-        // Register this client for broadcasting
+        uint8_t host_id = 0;
         {
             std::lock_guard<std::mutex> lock(clients_mutex);
-            host_to_client_fd[host_id] = client_fd;
+            // Try to find an existing host_id for this client_fd
+            bool found = false;
+            for (const auto& kv : host_to_client_fd) {
+                if (kv.second == client_fd) {
+                    host_id = kv.first;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                host_id = next_host_id.fetch_add(1);
+                host_to_client_fd[host_id] = client_fd;
+            }
         }
         
         while (running) {
@@ -170,12 +183,18 @@ public:
             } else {
                 resp.status = 1;
             }
-            
+            // printf("[DEBUG] Dumping response fields for debugging:\n");
+            // printf("  Status: %d\n", resp.status);
+            // printf("  Latency: %lu ns\n", resp.latency_ns);
+            // printf("  Address: 0x%lx\n", resp.addr); 
             ssize_t sent = send(client_fd, &resp, sizeof(resp), 0);
             if (sent != sizeof(resp)) {
                 std::cerr << "Failed to send response" << std::endl;
                 break;
             }
+            #ifdef DETAIL_STATS
+                print_hotness_report();
+            #endif
         }
         
         // Clean up host mappings on disconnect
@@ -227,9 +246,9 @@ public:
         resp.status = 0;
         resp.bisnp_req = bisnp_req_opcode;
         resp.addr = entry.metadata.physical_addr;
-        
+
         std::lock_guard<std::mutex> lock(clients_mutex);
-        
+
         // Iterate through all potential sharers (up to 16 hosts in bitmap)
         uint16_t sharers = entry.metadata.sharers_bitmap;
         for (uint8_t host_id = 0; host_id < 16 && sharers != 0; host_id++) {
@@ -241,11 +260,55 @@ public:
                     ssize_t sent = send(target_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
                     if (sent != sizeof(resp)) {
                         std::cerr << "Failed to send invalidation to host " << (int)host_id << std::endl;
+                        continue;
                     } else {
                         std::cout << "Sent back-invalidation to host " << (int)host_id 
                                   << " for addr 0x" << std::hex << entry.metadata.physical_addr 
                                   << std::dec << std::endl;
                     }
+
+                    // Wait for response from the host
+                        CXLMemSimRequest host_resp = {0};
+                        ssize_t recvd = recv(target_fd, &host_resp, sizeof(host_resp), MSG_WAITALL);
+                        if (recvd != sizeof(host_resp)) {
+                            std::cerr << "Failed to receive response from host " << (int)host_id << std::endl;
+                            continue;
+                        }
+
+                        // Validate BISnp response type according to request
+                        bool valid = false;
+                        switch (bisnp_req_opcode) {
+                            case BISnpCurr:
+                                // Can get BISnpE, BISnpS, BISnpI
+                                valid = (host_resp.bisnp_resp == BISnpE || host_resp.bisnp_resp == BISnpS || host_resp.bisnp_resp == BISnpI);
+                                break;
+                            case BISnpData:
+                                // Can get BISnpI or BISnpS
+                                valid = (host_resp.bisnp_resp == BISnpI || host_resp.bisnp_resp == BISnpS);
+                                break;
+                            case BISnpInv:
+                                // Can only get BISnpI
+                                valid = (host_resp.bisnp_resp == BISnpI);
+                                break;
+                            default:
+                                valid = false;
+                        }
+                        if (!valid) {
+                            std::cerr << "Warning: Unexpected BISnp response " << (int)host_resp.bisnp_resp
+                                      << " from host " << (int)host_id << " for opcode " << (int)bisnp_req_opcode << std::endl;
+                        }
+
+                        // If the host has modified data, write it back to shared memory (if it is shared or exclusive that usually means the data is not modified)
+                        if (host_resp.bisnp_resp == BISnpI) {
+                            std::cout << "Host " << (int)host_id << " provided modified data for addr 0x"
+                                      << std::hex << entry.metadata.physical_addr << std::dec << ". Writing back." << std::endl;
+                            memory_mutex.lock();
+                            memcpy(entry.data, host_resp.data, CACHELINE_SIZE);
+                            memory_mutex.unlock();
+                        } else {
+                            std::cout << "Host " << (int)host_id << " acknowledged invalidation for addr 0x"
+                                      << std::hex << entry.metadata.physical_addr << std::dec << std::endl;
+                        }
                 }
             }
         }
@@ -303,10 +366,12 @@ public:
                         broadcast_back_invalidation(entry, requester_id, BISnpData);
                         new_state = MESI_SHARED;
                         entry.metadata.sharers_bitmap |= (1 << requester_id);
+                        entry.metadata.owner_id = 0; // No single owner in shared state
                     }
                     break;
                 case MESI_SHARED:
                     entry.metadata.sharers_bitmap |= (1 << requester_id);
+                    entry.metadata.owner_id = 0; // No single owner in shared state
                     break;
                 case MESI_MODIFIED:
                     if (entry.metadata.owner_id != requester_id) {
@@ -314,6 +379,7 @@ public:
                         broadcast_back_invalidation(entry, requester_id, BISnpData);
                         new_state = MESI_SHARED;
                         entry.metadata.sharers_bitmap |= (1 << requester_id);
+                        entry.metadata.owner_id = 0; // No single owner in shared state
                     }
                     break;
             }
@@ -344,7 +410,7 @@ public:
             entry.metadata.virtual_addr = virt_addr;
             mapping_mutex.unlock();
         }
-        
+        CacheState old_state = static_cast<CacheState>(entry.metadata.cache_state);
         // Handle coherency state transition
         CacheState new_state = handle_coherency_transition(entry, host_id, false);
         
@@ -359,9 +425,14 @@ public:
         
         // Add latency based on state transition
         uint64_t base_latency = calculate_latency(size, true);
-        if (new_state == MESI_SHARED && (entry.metadata.cache_state == MESI_MODIFIED || entry.metadata.cache_state == MESI_EXCLUSIVE)) {
-            base_latency += 50; // Additional latency for writeback
+        if (old_state != MESI_INVALID || (old_state == MESI_SHARED && new_state == MESI_SHARED)) {
+            base_latency += base_bisnp_latency_ns; // Additional latency for BISnp response
         }
+        // if (new_state == MESI_SHARED && (old_state == MESI_MODIFIED)) {
+        //     base_latency += base_bisnp_latency_ns; // Additional latency for writeback
+        // }
+
+        
         
         return base_latency;
     }
@@ -401,8 +472,12 @@ public:
         
         // Add latency based on state transition
         uint64_t base_latency = calculate_latency(size, false);
-        if (old_state == MESI_SHARED || (old_state == MESI_MODIFIED && entry.metadata.owner_id != host_id)) {
-            base_latency += 100; // Additional latency for invalidation
+        // if (old_state == MESI_SHARED || (old_state == MESI_MODIFIED && entry.metadata.owner_id != host_id)) {
+        //     base_latency += 100; // Additional latency for invalidation
+        // }
+
+        if (old_state != MESI_INVALID || (old_state == MESI_SHARED && new_state == MESI_SHARED)) {
+            base_latency += base_bisnp_latency_ns; // Additional latency for BISnp response
         }
         
         return base_latency;
