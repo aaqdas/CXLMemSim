@@ -34,6 +34,12 @@ add_executable(cxlmemsim_server
     src/cxlmemsim_server_simple.cpp
 )
 
+add_executable(cache_tests
+    tests/cache_tests.cpp
+    src/cache.cpp
+)
+    
+
 target_link_libraries(cxlmemsim_server
     pthread
 )

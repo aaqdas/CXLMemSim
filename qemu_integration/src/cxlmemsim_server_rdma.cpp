@@ -15,13 +15,13 @@
 #include "../include/qemu_cxl_memsim.h"
 #include "../../include/rdma_communication.h"
 
-// Cache coherency states (MESI protocol)
-enum CacheState {
-    MESI_INVALID = 0,
-    MESI_SHARED = 1,
-    MESI_EXCLUSIVE = 2,
-    MESI_MODIFIED = 3
-};
+// // Cache coherency states (MESI protocol)
+// enum CacheState {
+//     MESI_INVALID = 0,
+//     MESI_SHARED = 1,
+//     MESI_EXCLUSIVE = 2,
+//     MESI_MODIFIED = 3
+// };
 
 // Memory entry structure (128 bytes total)
 struct CXLMemoryEntry {

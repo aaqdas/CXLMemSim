@@ -32,6 +32,15 @@ extern "C" {
 #define CXL_MESI_EXCLUSIVE 2
 #define CXL_MESI_MODIFIED  3
 
+// Cache coherency states (MESI protocol)
+enum CacheState {
+    MESI_INVALID = 0,
+    MESI_SHARED = 1,
+    MESI_EXCLUSIVE = 2,
+    MESI_MODIFIED = 3
+};
+
+
 /* Per-cacheline coherency state (8 bytes, atomically accessible) */
 typedef struct __attribute__((packed, aligned(8))) {
     uint8_t  state;           /* MESI state */
