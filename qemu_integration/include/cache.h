@@ -64,7 +64,7 @@ public:
     // }
 
     // Additional methods for cache operations (read, write, evict, etc.) would go here
-    void read(uint64_t addr, uint64_t* data, CacheState *mesi_state, bool* hit);
+    virtual void read(uint64_t addr, uint64_t* data, CacheState *mesi_state, bool* hit);
     //  {
     //     uint64_t set_no = (addr >> intLog2(line_size)) % num_sets;
     //     uint64_t tag    = (addr >> (intLog2(line_size) + intLog2(num_sets)));
@@ -84,7 +84,7 @@ public:
     //     // Handle miss (e.g., fetch from memory, evict if necessary, etc.)
     // }
 
-    void write(uint64_t addr, CacheState mesi_state, uint64_t* data, uint64_t write_size, uint64_t* wb_data, uint64_t *wb_addr, bool* wb_valid);
+    virtual void write(uint64_t addr, CacheState mesi_state, uint64_t* data, uint64_t write_size, uint64_t* wb_data, uint64_t *wb_addr, bool* wb_valid);
     // {
         // uint64_t set_no = (addr >> intLog2(line_size)) % num_sets;
         // uint64_t tag    = (addr >> (intLog2(line_size) + intLog2(num_sets)));
@@ -128,6 +128,8 @@ public:
 
 };
 #endif
+
+/* SnoopFilter moved to separate header/source: include/sf.h and src/sf.cpp */
 
 #ifdef __cplusplus
 }

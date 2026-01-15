@@ -20,6 +20,7 @@ Cache::Cache(uint32_t s, uint32_t a, uint32_t l) : num_sets(s), assoc(a), line_s
         }
     }
 }
+
 Cache::~Cache() {
     for (uint32_t i = 0; i < num_sets; ++i) {
         for (uint32_t j = 0; j < assoc; ++j) {
