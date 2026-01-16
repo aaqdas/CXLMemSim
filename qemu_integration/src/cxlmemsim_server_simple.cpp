@@ -25,6 +25,8 @@
 // #include "../include/cache.h"
 #include "../include/sf.h"
 #define DETAIL_STATS
+#define STANDALONE_TEST
+#define DEBUG
 // Memory entry structure (128 bytes total)
 struct CXLMemoryEntry {
     // Data portion (64 bytes)
@@ -182,35 +184,34 @@ public:
     }
     
     void handle_client(int client_fd) {
-        std::cout << "Client connected" << std::endl;
-        
-        // Assign or retrieve host ID for this client_fd
         static std::atomic<uint8_t> next_host_id{1};
-        uint8_t host_id = 0;
+        
+        // Assign host ID and register client
+        uint8_t host_id = next_host_id.fetch_add(1);
         
         {
             std::lock_guard<std::mutex> lock(clients_mutex);
-            // Try to find an existing host_id for this client_fd
-            bool found = false;
-            for (const auto& kv : host_to_client_fd) {
-                if (kv.second == client_fd) {
-                    host_id = kv.first;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                host_id = next_host_id.fetch_add(1);
-                host_to_client_fd[host_id] = client_fd;
-            }
+            host_to_client_fd[host_id] = client_fd;
         }
-    
+        
+        std::cout << "Client connected: host_id=" << static_cast<int>(host_id) 
+                  << ", fd=" << client_fd << std::endl;
         
         while (running) {
             // First try to receive enhanced request
+            #ifdef DEBUG
+            std::cout << "Waiting for request from Host " << (int)host_id << "..." << std::endl;
+            #endif
+           // First try to receive enhanced request
             EnhancedRequest req;
             ssize_t received = recv(client_fd, &req, sizeof(CXLMemSimRequest), MSG_WAITALL);
             
+            #ifdef DEBUG
+            std::cout << "Received request from Host " << (int)host_id << ": op_type=" << (int)req.op_type 
+                      << ", addr=0x" << std::hex << req.addr << std::dec 
+                      << ", size=" << req.size << " bytes" << std::endl;
+            std::cout << "Received bytes: " << received << std::endl; 
+            #endif
             if (received != sizeof(CXLMemSimRequest)) {
                 if (received == 0) {
                     std::cout << "Client disconnected (Host " << (int)host_id << ")" << std::endl;
@@ -219,7 +220,7 @@ public:
                 }
                 break;
             }
-            
+
             // Set host ID and virtual address if not provided
             req.host_id = host_id;
             req.virtual_addr = req.addr; // Use physical address as virtual if not provided
@@ -227,14 +228,29 @@ public:
             CXLMemSimResponse resp = {0};
             
             if (req.op_type == CXL_READ_OP) {
+                #ifdef DEBUG
+                    std::cout << "Read request from Host " << (int)host_id << " for addr 0x" << std::hex << req.addr << std::dec << " with size " << req.size << " bytes" << std::endl;
+                #endif
                 resp.latency_ns = handle_read(req.addr, resp.data, req.size, req.timestamp, req.host_id, req.virtual_addr);
                 resp.status = 0;
-                
+                CacheState state;
+                sf->read(req.addr, nullptr, &state, nullptr);
+                resp.data[CACHELINE_SIZE - 1] = static_cast<uint8_t>(state);
+                                
             } else if (req.op_type == CXL_WRITE_OP) {
+                #ifdef DEBUG
+                    std::cout << "Write request from Host " << (int)host_id << "for addr 0x" << std::hex << req.addr << std::dec << " with size " << req.size << " bytes" << std::endl;
+                #endif
                 resp.latency_ns = handle_write(req.addr, req.data, req.size, req.timestamp, req.host_id, req.virtual_addr);
                 resp.status = 0; 
+                CacheState state;
+                sf->read(req.addr, nullptr, &state, nullptr);
+                resp.data[CACHELINE_SIZE - 1] = static_cast<uint8_t>(state);
             } else {
                 resp.status = 1;
+                #ifdef DEBUG
+                std::cout << "Unknown operation type: " << (int)req.op_type << " from host " << (int)host_id << std::endl;     
+                #endif
             }
             
             ssize_t sent = send(client_fd, &resp, sizeof(resp), 0);
@@ -242,23 +258,21 @@ public:
                 std::cerr << "Failed to send response" << std::endl;
                 break;
             }
-            #ifdef DETAIL_STATS
-                print_hotness_report();
-            #endif
         }
         
         
         // Clean up host mappings on disconnect
-        mapping_mutex.lock();
-        auto it = virt_to_phys_map.begin();
-        while (it != virt_to_phys_map.end()) {
-            if (it->first.first == host_id) {
-                it = virt_to_phys_map.erase(it);
-            } else {
-                ++it;
+        {
+            std::lock_guard<std::mutex> lock(mapping_mutex);
+            auto it = virt_to_phys_map.begin();
+            while (it != virt_to_phys_map.end()) {
+                if (it->first.first == host_id) {
+                    it = virt_to_phys_map.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
-        mapping_mutex.unlock();
         
         // Unregister this client
         {
@@ -291,50 +305,71 @@ public:
    
     
     void broadcast_back_invalidate(uint64_t bi_addr, uint8_t requester_id, BISnpReqType bisnp_req_opcode, uint64_t bisnp_mask, bool invalidate_all) {
-        for (size_t host = 1; host < CXL_SHM_MAX_HOSTS; host++) {
-            if (host == requester_id && !invalidate_all) continue;
-            if (((1ULL << host) & bisnp_mask) == 0) continue;
-
+        #ifdef DEBUG
+        std::cout << "[DEBUG] broadcast_back_invalidate invoked addr=0x" << std::hex << bi_addr
+                  << " mask=0x" << bisnp_mask << std::dec << " requester=" << (int)requester_id
+                  << " opcode=" << (int)bisnp_req_opcode << " invalidate_all=" << invalidate_all << std::endl;
+        #endif
+        
+        // Build list of target hosts and their file descriptors outside the lock
+        std::vector<std::pair<uint8_t, int>> targets;
+        {
             std::lock_guard<std::mutex> lock(clients_mutex);
-            auto it = host_to_client_fd.find(host);
-            if (it != host_to_client_fd.end()) {
-                int target_fd = it->second;
-                CXLMemSimResponse resp = {0};
-                resp.status = 0;
-                resp.bisnp_req = bisnp_req_opcode;
-                resp.addr = bi_addr;
+            for (size_t host = 1; host < CXL_SHM_MAX_HOSTS; host++) {
+                if (host == requester_id && !invalidate_all) continue;
+                if (((1ULL << host) & bisnp_mask) == 0) continue;
 
-                ssize_t sent = send(target_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
-                if (sent != sizeof(resp)) {
-                    std::cerr << "Failed to send back-invalidation to host " << (int)host << std::endl;
-                    continue;
-                } else {
-                    std::cout << "Sent back-invalidation to host " << (int)host 
-                              << " for addr 0x" << std::hex << bi_addr 
-                              << std::dec << std::endl;
+                auto it = host_to_client_fd.find(host);
+                if (it != host_to_client_fd.end()) {
+                    targets.push_back({static_cast<uint8_t>(host), it->second});
                 }
-                // Receive a Response from the host to confirm invalidation
-                CXLMemSimRequest host_resp = {0};
-                ssize_t recvd = recv(target_fd, &host_resp, sizeof(host_resp), MSG_WAITALL);
-                if (recvd != sizeof(host_resp)) {
-                    std::cerr << "Failed to receive response from host " << (int)host << std::endl;
-                    continue;
-                }
-                #ifdef STANDALONE_TEST
-                if (host_resp.bisnp_resp == BISnpI) {
-                    // Write Data Back to Shared Memory
-                    // Write the full cacheline returned by the host back into the shared memory region
-                    size_t offset = bi_addr & ~(CACHELINE_SIZE - 1);
-                    assert (offset + CACHELINE_SIZE <= shm_size && "Shared memory write out of bounds");
-                        std::lock_guard<std::mutex> lock(memory_mutex);
-                        memcpy(static_cast<uint8_t*>(shm_base) + offset, host_resp.data, CACHELINE_SIZE);
+            }
+        }
+        
+        // Perform I/O operations without holding the lock
+        for (const auto& target : targets) {
+            uint8_t host = target.first;
+            int target_fd = target.second;
+            
+            CXLMemSimResponse resp = {0};
+            resp.status = 0;
+            resp.bisnp_req = bisnp_req_opcode;
+            resp.addr = bi_addr;
+
+            ssize_t sent = send(target_fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+            if (sent != sizeof(resp)) {
+                std::cerr << "Failed to send back-invalidation to host " << (int)host << std::endl;
+                continue;
+            } else {
+                std::cout << "Sent back-invalidation to host " << (int)host 
+                          << " for addr 0x" << std::hex << bi_addr 
+                          << std::dec << std::endl;
+            }
+            
+            // Receive a Response from the host to confirm invalidation
+            CXLMemSimRequest host_resp = {0};
+            ssize_t recvd = recv(target_fd, &host_resp, sizeof(host_resp), MSG_WAITALL);
+            if (recvd != sizeof(host_resp)) {
+                std::cerr << "Failed to receive response from host " << (int)host << std::endl;
+                continue;
+            }
+            
+            #ifdef STANDALONE_TEST
+            if (host_resp.bisnp_resp == BISnpI) {
+                // Write Data Back to Shared Memory
+                // Write the full cacheline returned by the host back into the shared memory region
+                size_t offset = bi_addr & ~(CACHELINE_SIZE - 1);
+                assert (offset + CACHELINE_SIZE <= shm_size && "Shared memory write out of bounds");
+                {
+                    std::lock_guard<std::mutex> lock(memory_mutex);
+                    memcpy(static_cast<uint8_t*>(shm_base) + offset, host_resp.data, CACHELINE_SIZE);
                     // Sync memory pages to ensure visibility to other processes
-                        if (msync(static_cast<uint8_t*>(shm_base) + offset, CACHELINE_SIZE, MS_SYNC) != 0) {
+                    if (msync(static_cast<uint8_t*>(shm_base) + offset, CACHELINE_SIZE, MS_SYNC) != 0) {
                         std::cerr << "msync failed: " << strerror(errno) << std::endl;
                     }
                 }
-                #endif            
             }
+            #endif            
         }
     }
 
@@ -345,11 +380,20 @@ public:
         if (is_write) {
             switch (old_state) {
                 case MESI_INVALID: {
+                    #ifdef DEBUG
+                    std::cout << "[DEBUG] sf->write(addr=0x" << std::hex << addr << ") request -> MESI_EXCLUSIVE, requester=" << std::dec << (int)requester_id << std::endl;
+                    #endif
                     sf->write(addr, MESI_EXCLUSIVE, bitmask | (1 << requester_id), &inv_mask, &inv_addr, &inv_valid);
+                    #ifdef DEBUG
+                    std::cout << "[DEBUG] sf->write returned inv_valid=" << inv_valid << " inv_mask=0x" << std::hex << inv_mask << " inv_addr=0x" << inv_addr << std::dec << std::endl;
+                    #endif
                     if (inv_valid) {
                         // Handle back-invalidation response if needed
                         broadcast_back_invalidate(inv_addr, requester_id, BISnpInv, inv_mask, true);
-                        *inv_issued = 1;
+                        if (inv_issued) *inv_issued = 1;
+                        #ifdef DEBUG
+                        std::cout << "[DEBUG] BI issued due to sf->write for addr=0x" << std::hex << inv_addr << " mask=0x" << inv_mask << std::dec << " requester=" << (int)requester_id << std::endl;
+                        #endif
                     }
                     return MESI_EXCLUSIVE;
                 }
@@ -369,24 +413,46 @@ public:
         } else {
             switch (old_state) {
                 case MESI_INVALID: {
+                    #ifdef DEBUG
+                    std::cout << "[DEBUG] sf->write(addr=0x" << std::hex << addr << ") request -> MESI_SHARED, requester=" << std::dec << (int)requester_id << std::endl;
+                    #endif
                     sf->write(addr, MESI_SHARED, bitmask | (1 << requester_id), &inv_mask, &inv_addr, &inv_valid);
+                    #ifdef DEBUG
+                    std::cout << "[DEBUG] sf->write returned inv_valid=" << inv_valid << " inv_mask=0x" << std::hex << inv_mask << " inv_addr=0x" << inv_addr << std::dec << std::endl;
+                    #endif
                     if (inv_valid) {
                         // Handle back-invalidation response if needed
                         broadcast_back_invalidate(inv_addr, requester_id, BISnpInv, inv_mask, true);
-                        *inv_issued = 1;
+                        if (inv_issued) *inv_issued = 1;
+                        std::cout << "[DEBUG] BI issued due to sf->write for addr=0x" << std::hex << inv_addr << " mask=0x" << inv_mask << std::dec << " requester=" << (int)requester_id << std::endl;
                     }
                     return MESI_EXCLUSIVE;
                 }
                 case MESI_SHARED: {
+                    #ifdef DEBUG
+                    std::cout << "[DEBUG] sf->write(addr=0x" << std::hex << addr << ") request -> MESI_SHARED (downgrade), requester=" << std::dec << (int)requester_id << std::endl;
+                    #endif
                     sf->write(addr, MESI_SHARED, bitmask | (1 << requester_id), &inv_mask, &inv_addr, &inv_valid);
+                    #ifdef DEBUG
+                    std::cout << "[DEBUG] sf->write returned inv_valid=" << inv_valid << " inv_mask=0x" << std::hex << inv_mask << " inv_addr=0x" << inv_addr << std::dec << std::endl;
+                    #endif
                     assert(inv_valid == false && "No Invalidation Should Be Issued[S->S]"); // Should not need to invalidate for shared read
                     return MESI_SHARED;
                 }
                 case MESI_EXCLUSIVE: {
+                    #ifdef DEBUG
+                    std::cout << "[DEBUG] sf->write(addr=0x" << std::hex << addr << ") request -> MESI_SHARED (E->S), requester=" << std::dec << (int)requester_id << std::endl;
+                    #endif
                     sf->write(addr, MESI_SHARED, bitmask | (1 << requester_id), &inv_mask, &inv_addr, &inv_valid);
+                    #ifdef DEBUG
+                    std::cout << "[DEBUG] sf->write returned inv_valid=" << inv_valid << " inv_mask=0x" << std::hex << inv_mask << " inv_addr=0x" << inv_addr << std::dec << std::endl;
+                    #endif
                     assert(inv_valid == false && "No Invalidation Should Be Issued [E->S]"); // Should not need to invalidate for shared read
                     broadcast_back_invalidate(addr, requester_id, BISnpData, bitmask, false);
-                    *inv_issued = 1;
+                    if (inv_issued) *inv_issued = 1;
+                    #ifdef DEBUG
+                    std::cout << "[DEBUG] BI issued (BISnpData) for addr=0x" << std::hex << addr << " mask=0x" << bitmask << std::dec << " requester=" << (int)requester_id << std::endl;
+                    #endif
                     return MESI_SHARED;
                 }
                 default: {
@@ -416,40 +482,41 @@ public:
 
         update_cacheline_stats(addr);
         
-        memory_mutex.lock();
-        
+        std::lock_guard<std::mutex> lock(memory_mutex);
+        #ifdef DEBUG
+        std::cout << "[DEBUG] handle_read invoked by host " << (int)host_id << " for addr=0x" << std::hex << addr << std::dec << std::endl;
+        std::cout << "[DEBUG] Reading snoop filter" << std::endl;
+        #endif
         sf->read(addr, &line_bitmask, &line_mesi_state, &hit);
+        #ifdef DEBUG
+        std::cout << "[DEBUG] sf->read addr=0x" << std::hex << addr << " mask=0x" << line_bitmask
+              << " state=" << std::dec << (int)line_mesi_state << " hit=" << hit << std::dec << std::endl;
+        #endif
    
-        // // Update virtual to physical mapping
-        // if (virt_addr != 0) {
-        //     mapping_mutex.lock();
-        //     virt_to_phys_map[{host_id, virt_addr}] = addr;
-        //     entry.metadata.virtual_addr = virt_addr;
-        //     mapping_mutex.unlock();
-        // }
         CacheState old_state = static_cast<CacheState>(line_mesi_state);
         // Handle coherency state transition
         CacheState new_state = handle_coherency_transition(addr, old_state, line_bitmask, host_id, false, &bi_issued);
-        
-        // Copy data
-       // memcpy(data, entry.data, std::min(size, (size_t)CACHELINE_SIZE));
-        #ifdef STANDALONE_TEST
-        // For standalone testing, read directly from the shared memory region
-        size_t offset = addr & ~(CACHELINE_SIZE - 1);
-        assert (offset + CACHELINE_SIZE <= shm_size && "Shared memory read out of bounds");
-        memcpy(data, static_cast<uint8_t*>(shm_base) + offset, std::min(size, (size_t)CACHELINE_SIZE));
+        #ifdef DEBUG
+        std::cout << "[DEBUG] handle_read: addr=0x" << std::hex << addr 
+                  << " old_state=" << (int)old_state 
+                  << " new_state=" << (int)new_state 
+                  << " line_bitmask=0x" << line_bitmask 
+                  << " bi_issued=" << (int)bi_issued 
+                  << std::dec << std::endl;
         #endif
-
-        memory_mutex.unlock();
+        // Copy data
+        #ifdef STANDALONE_TEST
+            // For standalone testing, read directly from the shared memory region
+            size_t offset = addr & ~(CACHELINE_SIZE - 1);
+            assert (offset + CACHELINE_SIZE <= shm_size && "Shared memory read out of bounds");
+            memcpy(data, static_cast<uint8_t*>(shm_base) + offset, std::min(size, (size_t)CACHELINE_SIZE));
+        #endif
         
         // Add latency based on state transition
         uint64_t base_latency = calculate_latency(size, true);
         if (bi_issued) {
             base_latency += base_bisnp_latency_ns; // Additional latency for BISnp response
         }
-        
-
-        
         
         return base_latency;
     }
@@ -462,6 +529,11 @@ public:
         uint8_t bi_issued = 0;
         
         sf->read(addr, &line_bitmask, &line_mesi_state, &hit);
+        #ifdef DEBUG
+        std::cout << "[DEBUG] sf->read addr=0x" << std::hex << addr << " mask=0x" << line_bitmask
+              << " state=" << std::dec << (int)line_mesi_state << " hit=" << hit << std::dec << std::endl;
+        std::cout << "[DEBUG] Write request for host " << (int)host_id << std::endl;
+        #endif
         // Handle coherency state transition
         CacheState old_state = static_cast<CacheState>(line_mesi_state); 
         CacheState new_state = handle_coherency_transition(addr, old_state, line_bitmask, host_id, true, &bi_issued);
@@ -510,6 +582,9 @@ public:
             
             std::thread client_thread(&CXLMemSimServer::handle_client, this, client_fd);
             client_thread.detach();
+            #ifdef DEBUG
+            std::cout << "Spawned thread to handle client connection (fd=" << client_fd << ")" << std::endl;
+            #endif
         }
     }
     
@@ -599,9 +674,10 @@ public:
         std::cout << "Total cacheline accesses: " << total_accesses << std::endl;
         
         // Virtual to Physical mapping statistics
-        mapping_mutex.lock();
-        std::cout << "\nVirtual to Physical Mappings: " << virt_to_phys_map.size() << " entries" << std::endl;
-        mapping_mutex.unlock();
+        {
+            std::lock_guard<std::mutex> mapping_lock(mapping_mutex);
+            std::cout << "\nVirtual to Physical Mappings: " << virt_to_phys_map.size() << " entries" << std::endl;
+        }
     }
 };
 

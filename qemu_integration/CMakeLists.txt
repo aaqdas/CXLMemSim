@@ -32,6 +32,8 @@ set_target_properties(CXLMemSim PROPERTIES
 # CXLMemSim server (simple version without full CXLController dependency)
 add_executable(cxlmemsim_server
     src/cxlmemsim_server_simple.cpp
+    src/sf.cpp
+    src/cache.cpp
 )
 
 add_executable(cache_tests
@@ -80,6 +82,8 @@ install(TARGETS cxlmemsim_server test_cxl_mem test_kbd_hook
 # Copy scripts
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/launch_qemu_cxl.sh
     ${CMAKE_CURRENT_BINARY_DIR}/launch_qemu_cxl.sh COPYONLY)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/launch_qemu_cxl1.sh
+    ${CMAKE_CURRENT_BINARY_DIR}/launch_qemu_cxl1.sh COPYONLY)
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/start_server.sh
     ${CMAKE_CURRENT_BINARY_DIR}/start_server.sh COPYONLY)
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/topology_simple.txt

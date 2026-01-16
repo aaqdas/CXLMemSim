@@ -11,11 +11,13 @@ DRIVE_IMAGE=/home/ali/OCEAN-V2/OCEAN/qemu_integration/build/qemu1.img
 KERNEL_IMAGE=/home/ali/OCEAN-V2/OCEAN/qemu_integration/build/bzImage
 
 # Enable SHM mode with lock-free coherency
-export CXL_TRANSPORT_MODE=shm
+export CXL_TRANSPORT_MODE=tcp
+export CXL_MEMSIM_HOST=192.168.100.1
+export CXL_MEMSIM_PORT=9999
 export CXL_HOST_ID=1
 $QEMU_BINARY \
     --enable-kvm -cpu qemu64,+xsave,+rdtscp,+avx,+avx2,+sse4.1,+sse4.2,+avx512f,+avx512dq,+avx512ifma,+avx512cd,+avx512bw,+avx512vl,+avx512vbmi,+clflushopt  \
-    -m 16G,maxmem=32G,slots=8 \
+    -m 4G,maxmem=32G,slots=8 \
     -smp 4 \
     -M q35,cxl=on \
     -kernel $KERNEL_IMAGE \
@@ -31,7 +33,7 @@ $QEMU_BINARY \
     -device cxl-type3,bus=root_port13,persistent-memdev=cxl-mem1,lsa=cxl-lsa1,id=cxl-pmem0,sn=0x1 \
     -device cxl-type1,bus=root_port14,size=1G,cache-size=64M \
     -device virtio-cxl-accel-pci,bus=pcie.0 \
-    -object memory-backend-file,id=cxl-mem1,share=on,mem-path=/dev/shm/cxlmemsim_shared,size=1G \
-    -object memory-backend-file,id=cxl-lsa1,share=on,mem-path=/dev/shm/lsa1.raw,size=1G \
+    -object memory-backend-file,id=cxl-mem1,share=on,mem-path=/dev/shm/cxlmemsim_shared,size=256M \
+    -object memory-backend-file,id=cxl-lsa1,share=on,mem-path=/dev/shm/lsa1.raw,size=64M \
     -M cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G \
     -nographic
