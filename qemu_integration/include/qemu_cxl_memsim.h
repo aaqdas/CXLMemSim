@@ -19,12 +19,19 @@ extern "C" {
  * Lock-free MESI coherency via shared memory for low-latency communication.
  * Layout: /dev/shm/cxlmemsim_coherency
  */
+#define DEFAULT_SHARED_MEM_FILE "/dev/shm/cxlmemsim_shared"
+#define DEFAULT_SHM_SIZE 1 * 1024 * 1024 * 1024
+
 
 #define CXL_SHM_COHERENCY_PATH "/dev/shm/cxlmemsim_coherency"
 #define CXL_SHM_COHERENCY_MAGIC 0x43584C4D  /* "CXLM" */
 #define CXL_SHM_COHERENCY_VERSION 1
 #define CXL_SHM_MAX_HOSTS 16
 #define CXL_SHM_MAX_CACHELINES (16 * 1024 * 1024)  /* 16M cachelines = 1GB memory */
+
+#define CXL_SF_SETS 2048
+#define CXL_SF_ASSOC 15
+
 
 /* MESI states */
 #define CXL_MESI_INVALID   0
@@ -39,6 +46,9 @@ enum CacheState {
     MESI_EXCLUSIVE = 2,
     MESI_MODIFIED = 3
 };
+
+typedef enum CacheState CacheState;
+
 
 
 /* Per-cacheline coherency state (8 bytes, atomically accessible) */
